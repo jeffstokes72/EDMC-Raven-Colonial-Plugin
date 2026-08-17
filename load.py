@@ -21,8 +21,43 @@ except ImportError:
     monitor = None
 
 # Plugin metadata
+try:
+    from sync_engine import (
+        apply_cargo_delta,
+        coerce_market_id,
+        commander_in_srv,
+        contributions_from_entry,
+        extract_fc_market_ids,
+        fc_cargo_diff_from_transfers,
+        fc_diff_from_market_trade,
+        is_fleet_carrier_station,
+        market_demands_from_items,
+        normalize_cargo_map,
+        normalize_commodity_key,
+        remaining_need_from_depot,
+        ship_cargo_from_cargo_event,
+        ship_delta_from_transfers,
+    )
+except ImportError:
+    from .sync_engine import (
+        apply_cargo_delta,
+        coerce_market_id,
+        commander_in_srv,
+        contributions_from_entry,
+        extract_fc_market_ids,
+        fc_cargo_diff_from_transfers,
+        fc_diff_from_market_trade,
+        is_fleet_carrier_station,
+        market_demands_from_items,
+        normalize_cargo_map,
+        normalize_commodity_key,
+        remaining_need_from_depot,
+        ship_cargo_from_cargo_event,
+        ship_delta_from_transfers,
+    )
+
 plugin_name = "RavenColonialSync"
-plugin_version = "8.4.3"
+plugin_version = "8.4.4"
 
 RCC_API_BASE = "https://ravencolonial100-awcbdvabgze4c5cq.canadacentral-01.azurewebsites.net"
 RCC_UX_BASE = "https://ravencolonial.com"
@@ -120,6 +155,18 @@ latest_market_data = {
     "demands": {}
 }
 
+dock_context = {
+    "station_type": "",
+    "market_id": 0,
+    "station_name": "",
+    "is_fc": False,
+}
+
+linked_fc_market_ids = set()
+_fc_lock = threading.Lock()
+current_ship_cargo = {}
+ship_cargo_capacity = 0
+
 active_route_target = {
     "system": "",
     "jumps_left": 0,
@@ -154,6 +201,17 @@ def get_cmdr_name():
     name = config.get_str("commander_name")
     if name and name.strip(): return name.strip()
     return "UnknownCmdr"
+
+
+def rcc_headers():
+    headers = {"Content-Type": "application/json"}
+    api_key = config.get_str("RCC_ApiKey")
+    if api_key:
+        headers["rcc-key"] = api_key
+    cmdr = get_cmdr_name()
+    if cmdr and cmdr != "UnknownCmdr":
+        headers["rcc-cmdr"] = cmdr
+    return headers
 
 def clean_station_name(name):
     if not name: return ""
@@ -211,15 +269,84 @@ def set_current_system(name, addr, pos):
 
     if changed: trigger_system_update(name)
 
-def set_last_docked(name, m_id):
+def set_last_docked(name, m_id, station_type=""):
     global last_docked_station
     if not name: return
-    try: m_id = int(m_id) if m_id else 0
-    except ValueError: m_id = 0
+    mid = coerce_market_id(m_id) or 0
     last_docked_station["name"] = name
-    last_docked_station["market_id"] = m_id
+    last_docked_station["market_id"] = mid
     config.set("RCC_LastStationName", name)
-    config.set("RCC_LastMarketID", str(m_id))
+    config.set("RCC_LastMarketID", str(mid))
+    if station_type:
+        set_dock_context(station_type, mid, name)
+    elif mid:
+        dock_context["market_id"] = mid
+        dock_context["station_name"] = name
+
+
+def set_dock_context(station_type, market_id, station_name=""):
+    dock_context["station_type"] = station_type or ""
+    dock_context["market_id"] = coerce_market_id(market_id) or 0
+    if station_name:
+        dock_context["station_name"] = station_name
+    dock_context["is_fc"] = is_fleet_carrier_station(dock_context["station_type"])
+
+
+def clear_dock_context():
+    dock_context.update({"station_type": "", "market_id": 0, "station_name": "", "is_fc": False})
+
+
+def sync_dock_from_state(state, station=None):
+    """Keep FC dock tracking aligned with EDMC state (startup-while-docked)."""
+    if not state:
+        return
+    if "StationType" in state:
+        stype = state.get("StationType") or ""
+        dock_context["station_type"] = stype
+        dock_context["is_fc"] = is_fleet_carrier_station(stype)
+    mid = coerce_market_id(state.get("MarketID"))
+    sname = state.get("StationName") or station or ""
+    if mid:
+        dock_context["market_id"] = mid
+    if sname:
+        dock_context["station_name"] = sname
+
+
+def is_docked_at_fc(state=None):
+    if dock_context.get("is_fc"):
+        return True
+    if state and is_fleet_carrier_station(state.get("StationType")):
+        return True
+    return False
+
+
+def current_fc_market_id(state=None, entry=None):
+    for source in (
+        (entry or {}).get("MarketID"),
+        dock_context.get("market_id"),
+        (state or {}).get("MarketID"),
+        last_docked_station.get("market_id"),
+    ):
+        mid = coerce_market_id(source)
+        if mid:
+            return mid
+    return None
+
+
+def remember_ship_capacity(state=None, entry=None):
+    global ship_cargo_capacity
+    for source in (entry, state):
+        if not source:
+            continue
+        cap = source.get("CargoCapacity")
+        if cap is None:
+            continue
+        try:
+            ship_cargo_capacity = int(cap)
+            return ship_cargo_capacity
+        except (TypeError, ValueError):
+            continue
+    return ship_cargo_capacity
 
 def resolve_market_id(target_name):
     if not target_name: return 0
@@ -982,25 +1109,22 @@ def read_market_json():
 def parse_market_data(market_data):
     global active_project, latest_market_data
     try:
-        m_id = market_data.get("id") or market_data.get("MarketID")
+        m_id = coerce_market_id(market_data.get("id") or market_data.get("MarketID"))
         if not m_id: return
-        m_id = int(m_id)
-        live_demands = {}
-        items = market_data.get("items") or market_data.get("Items") or []
+        station_type = market_data.get("StationType") or dock_context.get("station_type") or ""
+        # Fleet Carrier commodity boards are sell/buy orders, not construction remaining-need.
+        if is_fleet_carrier_station(station_type) and coerce_market_id(active_project.get("market_id")) != m_id:
+            log_debug(f"Ignoring FC market board {m_id} as construction remaining-need")
+            return
 
-        for item in items:
-            demand = item.get("demand") if item.get("demand") is not None else item.get("Demand", 0)
-            name = item.get("name") or item.get("Name", "")
-            if demand > 0:
-                name = name.lower().strip()
-                if name.startswith('$'): name = name.replace('$', '').replace('_name;', '').strip()
-                live_demands[name] = demand
+        items = market_data.get("items") or market_data.get("Items") or []
+        live_demands = market_demands_from_items(items)
 
         if live_demands:
             latest_market_data["market_id"] = m_id
             latest_market_data["demands"] = live_demands
 
-            if active_project.get("is_active") and active_project.get("market_id") == m_id:
+            if active_project.get("is_active") and coerce_market_id(active_project.get("market_id")) == m_id:
                 active_project["progress_data"] = live_demands
                 if config.get_str("RCC_HUDShowAllProjects") != "1" and hud_instance:
                     hud_instance.update_progress([{"title": None, "demands": live_demands}], force_show=True)
@@ -1070,10 +1194,30 @@ def fetch_project_progress():
 def sync_live_market_to_server(build_id, live_demands):
     api_key = config.get_str("RCC_ApiKey")
     if not api_key or not build_id: return
-    payload = {"buildId": build_id, "commodities": live_demands}
-    headers = {"rcc-key": api_key, "rcc-cmdr": get_cmdr_name(), "Content-Type": "application/json"}
-    try: session.post(f"{RCC_API_BASE}/api/project/{urllib.parse.quote(build_id)}", json=payload, headers=headers, timeout=10)
-    except Exception as e: log_error(f"Live Market Sync Error: {e}")
+    commodities = normalize_cargo_map(live_demands) if live_demands else {}
+    # Keep explicit zeros (fulfilled depot items) that normalize_cargo_map drops.
+    if isinstance(live_demands, dict):
+        for raw_key, raw_value in live_demands.items():
+            key = normalize_commodity_key(raw_key)
+            if not key:
+                continue
+            try:
+                amount = int(raw_value)
+            except (TypeError, ValueError):
+                continue
+            if amount == 0 and key not in commodities:
+                commodities[key] = 0
+    payload = {"buildId": build_id, "commodities": commodities}
+    headers = rcc_headers()
+    url = f"{RCC_API_BASE}/api/project/{urllib.parse.quote(str(build_id))}"
+    try:
+        resp = session.patch(url, json=payload, headers=headers, timeout=10)
+        if resp.status_code in (404, 405):
+            resp = session.post(url, json=payload, headers=headers, timeout=10)
+        if resp.status_code not in (200, 201, 204):
+            log_error(f"Live Market Sync HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"Live Market Sync Error: {e}")
 
 def trigger_system_update(sys_name):
     if hud_instance: hud_instance.update_system(sys_name, force_show=True)
@@ -1134,7 +1278,7 @@ def fetch_and_display_jump(system_name, s_class, jumps_remaining):
         active_route_target['last_info_str'] = info_str
 
         if hud_instance and config.get_str("RCC_HUDShowJump") != "0":
-            hud_instance.safe_execute(lambda: hud_instance.jump_var.set(info_str))
+            hud_instance.safe_execute(lambda info=info_str: hud_instance.jump_var.set(info))
             hud_instance.show_hud()
 
     except Exception as e:
@@ -1273,6 +1417,7 @@ def prefs_changed(cmdr, is_beta):
         if hud_instance:
             hud_instance.apply_settings()
             threading.Thread(target=fetch_project_progress, daemon=True).start()
+        threading.Thread(target=refresh_linked_fcs, daemon=True).start()
     except Exception as e:
         log_error(f"Crash in prefs_changed:\n{traceback.format_exc()}")
         show_edmc_error()
@@ -1305,6 +1450,10 @@ def plugin_start3(plugin_dir):
             last_docked_station["market_id"] = m_id
 
         restore_active_project()
+        if monitor and getattr(monitor, "state", None):
+            sync_dock_from_state(monitor.state)
+            remember_ship_capacity(monitor.state)
+        threading.Thread(target=refresh_linked_fcs, daemon=True).start()
         return plugin_name
     except Exception as e:
         log_error(f"Crash in plugin_start3:\n{traceback.format_exc()}")
@@ -1385,24 +1534,143 @@ def plugin_stop():
     except Exception as e:
         log_error(f"Crash in plugin_stop:\n{traceback.format_exc()}")
 
-def cmdrs_data(data, is_beta):
+def cmdr_data(data, is_beta):
+    """EDMC CAPI hook (correct name). Companion market is not used as FC cargo."""
     try:
-        log_debug("cmdrs_data hook fired from EDMC CAPI.")
+        log_debug("cmdr_data hook fired from EDMC CAPI.")
         market_data = data.get("market")
-        if market_data: parse_market_data(market_data)
-        else: log_debug("No 'market' key found in CAPI payload.")
+        if market_data:
+            parse_market_data(market_data)
+        else:
+            log_debug("No 'market' key found in CAPI payload.")
     except Exception as e:
-        log_error(f"Crash in cmdrs_data:\n{traceback.format_exc()}")
+        log_error(f"Crash in cmdr_data:\n{traceback.format_exc()}")
         show_edmc_error()
 
+
+# Older typo: EDMC never called this, so CAPI market sync was dead.
+cmdrs_data = cmdr_data
+
+
+def maybe_bind_active_project_market(station_name, m_id):
+    if not active_project.get("is_active"):
+        return
+    c_docked = clean_station_name(station_name).lower()
+    c_target = clean_station_name(active_project.get("name")).lower()
+    if not c_docked or not c_target:
+        return
+    if c_docked == c_target or c_docked in c_target or c_target in c_docked:
+        mid = coerce_market_id(m_id)
+        if mid and coerce_market_id(active_project.get("market_id")) != mid:
+            active_project["market_id"] = mid
+            save_active_project()
+
+
+def queue_ship_publish(state, cargo_dict=None):
+    global current_ship_cargo
+    if cargo_dict is not None:
+        current_ship_cargo = normalize_cargo_map(cargo_dict)
+    remember_ship_capacity(state)
+    ship_name = (state or {}).get("ShipName") or "Unknown"
+    ship_type = (state or {}).get("ShipType") or "Unknown"
+    threading.Thread(
+        target=publish_current_ship,
+        args=(get_cmdr_name(), ship_name, ship_type, dict(current_ship_cargo), ship_cargo_capacity),
+        daemon=True,
+    ).start()
+
+
+def handle_cargo_transfer(entry, state):
+    """Ship <-> Fleet Carrier (and SRV) transfers: PATCH FC cargo, update ship hold."""
+    global current_ship_cargo
+    transfers = entry.get("Transfers") or []
+    is_srv = commander_in_srv(state)
+    fc_diff = fc_cargo_diff_from_transfers(transfers, is_srv=is_srv)
+    ship_diff = ship_delta_from_transfers(transfers)
+
+    if fc_diff and is_docked_at_fc(state):
+        mid = current_fc_market_id(state, entry)
+        if mid:
+            log_info(f"CargoTransfer to/from FC {mid}: {fc_diff} (srv={is_srv})")
+            threading.Thread(target=supply_fc_cargo, args=(mid, fc_diff), daemon=True).start()
+        else:
+            log_error(f"CargoTransfer FC delta {fc_diff} dropped: no MarketID while docked at carrier")
+    elif fc_diff:
+        log_debug(f"Ignoring CargoTransfer FC delta while not docked at a Fleet Carrier: {fc_diff}")
+
+    if ship_diff:
+        if current_ship_cargo:
+            current_ship_cargo = apply_cargo_delta(current_ship_cargo, ship_diff)
+            queue_ship_publish(state)
+        else:
+            log_debug("CargoTransfer ship delta held until a Cargo snapshot provides a baseline")
+
+
+def handle_market_trade(entry, state, is_buy):
+    """MarketBuy/Sell: FC cargo deltas at a carrier; otherwise ship hold only."""
+    global current_ship_cargo
+    if is_docked_at_fc(state):
+        mid = current_fc_market_id(state, entry)
+        fc_diff = fc_diff_from_market_trade(entry, is_buy=is_buy)
+        if mid and fc_diff:
+            log_info(f"{'MarketBuy from' if is_buy else 'MarketSell to'} FC {mid}: {fc_diff}")
+            threading.Thread(target=supply_fc_cargo, args=(mid, fc_diff), daemon=True).start()
+    commodity = normalize_commodity_key(entry.get("Type") or "")
+    try:
+        count = int(entry.get("Count", 0) or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if commodity and count > 0 and current_ship_cargo:
+        current_ship_cargo = apply_cargo_delta(current_ship_cargo, {commodity: count if is_buy else -count})
+        queue_ship_publish(state)
+
+
+def handle_colonisation_depot(entry):
+    remaining = remaining_need_from_depot(entry)
+    m_id = coerce_market_id(entry.get("MarketID"))
+    if m_id is None or entry.get("ResourcesRequired") is None:
+        return
+    hud_demands = {k: v for k, v in remaining.items() if v > 0}
+    latest_market_data["market_id"] = m_id
+    latest_market_data["demands"] = hud_demands
+    if active_project.get("is_active") and coerce_market_id(active_project.get("market_id")) == m_id:
+        active_project["progress_data"] = hud_demands
+        build_id = active_project.get("build_id")
+        if build_id and not active_project.get("force_bypass"):
+            # Include zeros so fulfilled commodities are cleared server-side.
+            threading.Thread(target=sync_live_market_to_server, args=(build_id, remaining), daemon=True).start()
+        if config.get_str("RCC_HUDShowAllProjects") != "1" and hud_instance:
+            hud_instance.update_progress([{"title": None, "demands": hud_demands}], force_show=True)
+
+
+def handle_colonisation_contribution(entry):
+    cargo_diff = contributions_from_entry(entry)
+    if not cargo_diff or not active_project.get("is_active") or not active_project.get("build_id"):
+        return
+    event_mid = coerce_market_id(entry.get("MarketID"))
+    project_mid = coerce_market_id(active_project.get("market_id"))
+    if event_mid and project_mid and event_mid != project_mid:
+        log_debug(f"ColonisationContribution market {event_mid} != active project {project_mid}; skipping")
+        return
+    log_info(f"ColonisationContribution {cargo_diff} -> {active_project.get('build_id')}")
+    threading.Thread(
+        target=contribute_to_project,
+        args=(active_project["build_id"], get_cmdr_name(), cargo_diff),
+        daemon=True,
+    ).start()
+
+
 def journal_entry(cmdr, is_beta, system, station, entry, state):
-    global current_system, active_project, system_scans_cache, last_docked_station, latest_market_data, active_route_target
+    global current_system, active_project, system_scans_cache, last_docked_station, latest_market_data, active_route_target, current_ship_cargo, ship_cargo_capacity
     try:
         event = entry.get('event')
         if state and state.get('SystemName') and current_system['name'] != state.get('SystemName'):
             set_current_system(state.get('SystemName'), state.get('SystemAddress', 0), state.get('StarPos', [0.0, 0.0, 0.0]))
         if system and current_system['name'] != system:
             set_current_system(system, current_system['address'], current_system['pos'])
+
+        if event != 'Undocked':
+            sync_dock_from_state(state, station)
 
         if event == 'NavRouteClear':
             active_route_target['jumps_left'] = 0
@@ -1428,30 +1696,20 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             threading.Thread(target=fetch_and_display_jump, args=(sys_name, star_class, jumps), daemon=True).start()
 
         elif event == 'ColonisationConstructionDepot':
-            m_id = entry.get('MarketID')
-            if m_id:
-                m_id = int(m_id)
-                live_demands = {}
-                for req in entry.get('ResourcesRequired', []):
-                    name = req.get('Name', '').lower()
-                    if name.startswith('$'): name = name.replace('$', '').replace('_name;', '').strip()
-                    required = req.get('RequiredAmount', 0)
-                    provided = req.get('ProvidedAmount', 0)
-                    demand = required - provided
-                    if demand > 0: live_demands[name] = demand
+            handle_colonisation_depot(entry)
 
-                if live_demands:
-                    latest_market_data["market_id"] = m_id
-                    latest_market_data["demands"] = live_demands
+        elif event == 'ColonisationContribution':
+            handle_colonisation_contribution(entry)
 
-                    if active_project.get("is_active") and active_project.get("market_id") == m_id:
-                        active_project["progress_data"] = live_demands
-                        build_id = active_project.get("build_id")
-                        if build_id and not active_project.get("force_bypass"):
-                            threading.Thread(target=sync_live_market_to_server, args=(build_id, live_demands), daemon=True).start()
-
-                    if config.get_str("RCC_HUDShowAllProjects") != "1" and active_project.get("is_active"):
-                        if hud_instance: hud_instance.update_progress([{"title": None, "demands": live_demands}], force_show=True)
+        elif event == 'Market':
+            market_data = read_market_json()
+            if market_data:
+                if not market_data.get("StationType") and dock_context.get("station_type"):
+                    market_data = dict(market_data)
+                    market_data["StationType"] = dock_context["station_type"]
+                parse_market_data(market_data)
+            else:
+                log_debug("Market event received but Market.json was not readable")
 
         elif event == 'Location':
             set_current_system(entry.get('StarSystem', 'Unknown System'), entry.get('SystemAddress', 0), entry.get('StarPos', [0.0, 0.0, 0.0]))
@@ -1459,13 +1717,12 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             if entry.get('Docked'):
                 m_id = entry.get('MarketID', 0)
                 s_name = entry.get("StationName", "")
-                set_last_docked(s_name, m_id)
-                if active_project['is_active']:
-                    c_docked, c_target = clean_station_name(s_name).lower(), clean_station_name(active_project['name']).lower()
-                    if c_docked == c_target or c_docked in c_target or c_target in c_docked:
-                        if active_project['market_id'] != m_id:
-                            active_project['market_id'] = m_id
-                            save_active_project()
+                set_last_docked(s_name, m_id, entry.get("StationType", ""))
+                maybe_bind_active_project_market(s_name, m_id)
+                if is_fleet_carrier_station(entry.get("StationType")):
+                    threading.Thread(target=on_docked_fleet_carrier, args=(m_id, s_name, entry.get("StationName", "")), daemon=True).start()
+            else:
+                clear_dock_context()
 
         elif event == 'FSDJump':
             set_current_system(entry.get('StarSystem', 'Unknown System'), entry.get('SystemAddress', 0), entry.get('StarPos', [0.0, 0.0, 0.0]))
@@ -1481,7 +1738,7 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
                 else: jump_info += "\nUninhabited"
 
                 if hud_instance:
-                    hud_instance.safe_execute(lambda: hud_instance.jump_var.set(jump_info))
+                    hud_instance.safe_execute(lambda info=jump_info: hud_instance.jump_var.set(info))
                     hud_instance.show_hud()
             else:
                 if hud_instance: hud_instance.safe_execute(lambda: hud_instance.jump_var.set(""))
@@ -1505,19 +1762,27 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
             if system_scans_cache:
                 threading.Thread(target=update_sys_bodies, args=(system_address, list(system_scans_cache.values())), daemon=True).start()
 
+        elif event == 'Loadout':
+            ship_raw = str(entry.get('Ship', '')).lower()
+            if 'fighter' not in ship_raw and 'buggy' not in ship_raw:
+                remember_ship_capacity(state, entry)
+
         elif event == 'Cargo':
-            ship_name = state.get('ShipName', 'Unknown')
-            ship_type = state.get('ShipType', 'Unknown')
-            cargo_dict = {item['Name']: item['Count'] for item in entry.get('Inventory', [])}
-            threading.Thread(target=publish_current_ship, args=(get_cmdr_name(), ship_name, ship_type, cargo_dict), daemon=True).start()
+            cargo_dict, confident = ship_cargo_from_cargo_event(entry, state)
+            remember_ship_capacity(state, entry)
+            if confident:
+                queue_ship_publish(state, cargo_dict)
+            else:
+                log_debug(f"Sparse Cargo event Count={entry.get('Count')} with no inventory/state; not publishing empty hold")
+
+        elif event == 'CargoTransfer':
+            handle_cargo_transfer(entry, state)
+
+        elif event == 'MarketBuy':
+            handle_market_trade(entry, state, is_buy=True)
 
         elif event == 'MarketSell':
-            if active_project['is_active'] and active_project.get('build_id'):
-                m_id = entry.get('MarketID')
-                if m_id and str(m_id) == str(active_project.get('market_id')):
-                    commodity = entry.get('Type', '').lower()
-                    if commodity.startswith('$'): commodity = commodity.replace('$', '').replace('_name;', '').strip()
-                    threading.Thread(target=contribute_to_project, args=(active_project['build_id'], get_cmdr_name(), {commodity: entry.get('Count', 0)}), daemon=True).start()
+            handle_market_trade(entry, state, is_buy=False)
 
         elif event in ['CarrierJump', 'CarrierBuy']:
             threading.Thread(target=publish_fleet_carrier, args=(get_cmdr_name(), entry.get('MarketID'), entry.get('CarrierName', 'Unknown Carrier'), entry.get('Callsign', 'XXX-XXX')), daemon=True).start()
@@ -1525,18 +1790,16 @@ def journal_entry(cmdr, is_beta, system, station, entry, state):
         elif event == 'Docked':
             station_name = entry.get('StationName', '')
             m_id = entry.get('MarketID', 0)
-            set_last_docked(station_name, m_id)
-            if active_project['is_active']:
-                c_docked, c_target = clean_station_name(station_name).lower(), clean_station_name(active_project['name']).lower()
-                if c_docked == c_target or c_docked in c_target or c_target in c_docked:
-                    if active_project['market_id'] != m_id:
-                        active_project['market_id'] = m_id
-                        save_active_project()
+            set_last_docked(station_name, m_id, entry.get('StationType', ''))
+            maybe_bind_active_project_market(station_name, m_id)
 
-            if entry.get('StationType') == 'FleetCarrier':
-                threading.Thread(target=publish_fleet_carrier, args=(get_cmdr_name(), m_id, station_name, "Docked-FC"), daemon=True).start()
+            if is_fleet_carrier_station(entry.get('StationType')):
+                threading.Thread(target=on_docked_fleet_carrier, args=(m_id, station_name, entry.get('StationName', '')), daemon=True).start()
 
             if hud_instance: hud_instance.show_hud()
+
+        elif event == 'Undocked':
+            clear_dock_context()
 
     except Exception as e:
         log_error(f"Critical Journal Error processing event {entry.get('event', 'Unknown')}:\n{traceback.format_exc()}")
@@ -1692,24 +1955,144 @@ def create_raven_project_api():
     except Exception as e:
         trigger_error_popup("Script Crash", f"An error occurred during linking:\n\n{e}")
 
-def publish_current_ship(cmdr_name, ship_name, ship_type, cargo_dict):
+def publish_current_ship(cmdr_name, ship_name, ship_type, cargo_dict, max_cargo=None):
     api_key = config.get_str("RCC_ApiKey")
     if not api_key: return
-    max_cargo = sum(cargo_dict.values()) if cargo_dict else 100
-    try: session.post(f"{RCC_API_BASE}/api/cmdr/currentShip", json={"cmdr": get_cmdr_name(), "name": ship_name, "type": ship_type, "maxCargo": max_cargo, "cargo": cargo_dict}, headers={"rcc-key": api_key, "Content-Type": "application/json"}, timeout=10)
-    except Exception as e: log_error(f"Ship Sync Error: {e}")
+    cargo_dict = normalize_cargo_map(cargo_dict)
+    try:
+        max_cargo_i = int(max_cargo) if max_cargo is not None else int(ship_cargo_capacity or 0)
+    except (TypeError, ValueError):
+        max_cargo_i = int(ship_cargo_capacity or 0)
+    if max_cargo_i <= 0:
+        max_cargo_i = sum(cargo_dict.values()) if cargo_dict else 0
+    payload = {
+        "cmdr": get_cmdr_name(),
+        "name": ship_name,
+        "type": ship_type,
+        "maxCargo": max_cargo_i,
+        "cargo": cargo_dict,
+    }
+    try:
+        resp = session.post(
+            f"{RCC_API_BASE}/api/cmdr/currentShip",
+            json=payload,
+            headers=rcc_headers(),
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201, 204):
+            log_error(f"Ship Sync HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"Ship Sync Error: {e}")
 
 def contribute_to_project(build_id, cmdr_name, cargo_diff):
+    cargo_diff = normalize_cargo_map(cargo_diff)
     if not cargo_diff: return
     try:
-        resp = session.post(f"{RCC_API_BASE}/api/project/{urllib.parse.quote(build_id)}/contribute/{urllib.parse.quote(get_cmdr_name())}", json=cargo_diff, headers={"Content-Type": "application/json", "rcc-key": config.get_str("RCC_ApiKey")}, timeout=10)
-        if resp.status_code in [200, 201, 204]: threading.Thread(target=fetch_project_progress, daemon=True).start()
-    except Exception as e: log_error(f"Contribution Error: {e}")
+        resp = session.post(
+            f"{RCC_API_BASE}/api/project/{urllib.parse.quote(str(build_id))}/contribute/{urllib.parse.quote(get_cmdr_name())}",
+            json=cargo_diff,
+            headers=rcc_headers(),
+            timeout=10,
+        )
+        if resp.status_code in [200, 201, 204]:
+            threading.Thread(target=fetch_project_progress, daemon=True).start()
+        else:
+            log_error(f"Contribution HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"Contribution Error: {e}")
 
 def publish_fleet_carrier(cmdr_name, market_id, name, callsign):
-    if not config.get_str("RCC_ApiKey"): return
-    try: session.put(f"{RCC_API_BASE}/api/fc/{market_id}", json={"marketId": market_id, "name": callsign, "displayName": name, "cargo": None}, headers={"rcc-key": config.get_str("RCC_ApiKey"), "rcc-cmdr": get_cmdr_name(), "Content-Type": "application/json"}, timeout=10)
-    except Exception as e: log_error(f"FC Sync Error: {e}")
+    """Update FC metadata only. Never send cargo: None — that can wipe the hold."""
+    api_key = config.get_str("RCC_ApiKey")
+    mid = coerce_market_id(market_id)
+    if not api_key or not mid:
+        return
+    payload = {"marketId": mid}
+    if callsign:
+        payload["name"] = callsign
+    if name:
+        payload["displayName"] = name
+    try:
+        resp = session.patch(f"{RCC_API_BASE}/api/fc/{mid}", json=payload, headers=rcc_headers(), timeout=10)
+        if resp.status_code in (404, 405):
+            resp = session.put(f"{RCC_API_BASE}/api/fc/{mid}", json=payload, headers=rcc_headers(), timeout=10)
+        if resp.status_code not in (200, 201, 204):
+            log_error(f"FC metadata sync HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"FC Sync Error: {e}")
+
+
+def refresh_linked_fcs():
+    """Load MarketIDs the commander (and active projects) may PATCH cargo for."""
+    api_key = config.get_str("RCC_ApiKey")
+    cmdr = get_cmdr_name()
+    if not api_key or not cmdr or cmdr == "UnknownCmdr":
+        return
+    ids = set()
+    headers = rcc_headers()
+    quoted = urllib.parse.quote(cmdr)
+    try:
+        resp = session.get(f"{RCC_API_BASE}/api/cmdr/{quoted}/fc/all", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            ids.update(extract_fc_market_ids(resp.json()))
+        elif resp.status_code not in (404,):
+            log_error(f"Linked FC list HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"Linked FC list error: {e}")
+    try:
+        resp = session.get(f"{RCC_API_BASE}/api/cmdr/{quoted}/active", headers=headers, timeout=10)
+        if resp.status_code == 200:
+            ids.update(extract_fc_market_ids(resp.json()))
+    except Exception as e:
+        log_error(f"Active-project FC list error: {e}")
+    with _fc_lock:
+        linked_fc_market_ids.clear()
+        linked_fc_market_ids.update(ids)
+    log_info(f"Linked FCs eligible for cargo sync: {sorted(ids) if ids else 'none — link carriers on ravencolonial.com'}")
+
+
+def is_linked_fc(market_id):
+    mid = coerce_market_id(market_id)
+    if not mid:
+        return False
+    with _fc_lock:
+        return mid in linked_fc_market_ids
+
+
+def supply_fc_cargo(market_id, cargo_diff):
+    """PATCH signed cargo deltas onto a Fleet Carrier hold."""
+    api_key = config.get_str("RCC_ApiKey")
+    mid = coerce_market_id(market_id)
+    cargo_diff = normalize_cargo_map(cargo_diff)
+    if not api_key or not mid or not cargo_diff:
+        return
+    if linked_fc_market_ids and not is_linked_fc(mid):
+        log_debug(f"FC {mid} is not linked on Raven Colonial; attempting cargo PATCH anyway")
+    try:
+        resp = session.patch(
+            f"{RCC_API_BASE}/api/fc/{mid}/cargo",
+            json=cargo_diff,
+            headers=rcc_headers(),
+            timeout=15,
+        )
+        if resp.status_code in (200, 201, 204):
+            log_info(f"FC {mid} cargo delta synced: {cargo_diff}")
+        else:
+            log_error(f"FC cargo PATCH {mid} HTTP {resp.status_code}: {resp.text[:250]}")
+    except Exception as e:
+        log_error(f"FC cargo PATCH error: {e}")
+
+
+def on_docked_fleet_carrier(market_id, display_name, callsign=""):
+    refresh_linked_fcs()
+    mid = coerce_market_id(market_id)
+    if not mid:
+        return
+    publish_fleet_carrier(get_cmdr_name(), mid, display_name, callsign or "Docked-FC")
+    if not is_linked_fc(mid) and not linked_fc_market_ids:
+        log_info(f"Docked at FC {mid} with no linked carriers loaded. Link it on ravencolonial.com for cargo tracking.")
+    elif not is_linked_fc(mid):
+        log_info(f"Docked at FC {mid} which is not in the linked-carrier list; transfers will still be PATCHed.")
 
 def update_sys_bodies(address, bods):
     if not config.get_str("RCC_ApiKey") or not bods: return
